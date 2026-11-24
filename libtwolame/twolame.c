@@ -186,11 +186,29 @@ static int init_header_info(twolame_options * glopts)
 
 int twolame_init_params(twolame_options * glopts)
 {
+    twolame_options *snapshot = NULL;
+
+    // Guard against a NULL options pointer
+    if (glopts == NULL) {
+        fprintf(stderr, "twolame_init_params(): NULL options pointer.\n");
+        return -1;
+    }
 
     if (glopts->twolame_init) {
         fprintf(stderr, "Already called twolame_init_params() once.\n");
         return 1;
     }
+
+    /*
+     * Snapshot the options so that a failed initialisation can be
+     * rolled back, leaving the session clean for a corrected retry.
+     */
+    snapshot = (twolame_options *) TWOLAME_MALLOC(sizeof(twolame_options));
+    if (snapshot == NULL) {
+        fprintf(stderr, "twolame_init_params(): out of memory.\n");
+        return -1;
+    }
+    memcpy(snapshot, glopts, sizeof(twolame_options));
     // Check the number of channels
     if (glopts->num_channels_in != 1 && glopts->num_channels_in != 2) {
         if (glopts->num_channels_in == 0) {
@@ -203,7 +221,7 @@ int twolame_init_params(twolame_options * glopts)
             fprintf(stderr,
                     "Error: twolame cannot encode files with more than 2 channels.\n");
         }
-        return -1;
+        goto fail;
     }
     // If not output samplerate has been set, then set it to the input sample rate
     if (glopts->samplerate_out < 1) {
@@ -216,7 +234,7 @@ int twolame_init_params(twolame_options * glopts)
         if (glopts->version < 0) {
             fprintf(stderr, "twolame_init_params(): invalid samplerate: %i\n",
                     glopts->samplerate_out);
-            return -1;
+            goto fail;
         } else if (glopts->verbosity >= 3) {
             fprintf(stderr, "Chosen version '%s' for samplerate of %d Hz.\n",
                     twolame_mpeg_version_name(glopts->version), glopts->samplerate_out);
@@ -300,14 +318,14 @@ int twolame_init_params(twolame_options * glopts)
             if (glopts->bitrate > 192) {
                 fprintf(stderr, "twolame_init_params(): %dkbps is an invalid bitrate for mono encoding.\n",
                         glopts->bitrate);
-                return -1;
+                goto fail;
             }
         }
         else {
             if (glopts->bitrate < 64 || glopts->bitrate == 80) {
                 fprintf(stderr, "twolame_init_params(): %dkbps is an invalid bitrate for 2ch encoding.\n",
                         glopts->bitrate);
-                return -1;
+                goto fail;
             }
         }
     }
@@ -316,7 +334,7 @@ int twolame_init_params(twolame_options * glopts)
        the only ones inserting information into the ancillary section of the frame */
     if (glopts->do_dab && glopts->do_energy_levels) {
         fprintf(stderr, "Error: Can't do DAB and Energy Levels at the same time\n");
-        return -1;
+        goto fail;
     }
 
     /* Set the number of ancillary bits automatically, if none set */
@@ -334,7 +352,7 @@ int twolame_init_params(twolame_options * glopts)
         if (glopts->num_ancillary_bits < required) {
             fprintf(stderr, "Warning: Too few ancillary bits to store energy levels: %i<%i\n",
                     glopts->num_ancillary_bits, required);
-            return -1;
+            goto fail;
         }
     }
 
@@ -355,14 +373,14 @@ int twolame_init_params(twolame_options * glopts)
     /* Can't do padding and VBR at same time */
     if (glopts->vbr && glopts->padding == TRUE) {
         fprintf(stderr, "Error: Can't do padding and VBR at same time\n");
-        return -1;
+        goto fail;
     }
 
     /* Simple patch for the `bit_stream buffer needs to be bigger' warning */
     /* Fix FREEFORMAT_MAX_BITRATE definition when github issue #51 will be closed */
     if (glopts->freeformat && glopts->bitrate > FREEFORMAT_MAX_BITRATE) {
         fprintf(stderr, "twolame_init_params(): cannot encode freeformat stream at %d kbps\n", glopts->bitrate);
-        return -1;
+        goto fail;
     }
 
     // Set the Number of output channels
@@ -372,21 +390,21 @@ int twolame_init_params(twolame_options * glopts)
 
     // build mpeg header from parameters
     if (init_header_info(glopts) < 0) {
-        return -1;
+        goto fail;
     }
     // initialise bitrate allocation
     if (twolame_init_bit_allocation(glopts) < 0) {
-        return -1;
+        goto fail;
     }
     // Select table number and sblimit
     if (twolame_encode_init(glopts) < 0) {
-        return -1;
+        goto fail;
     }
     // Check input samplerate is same as output samplerate
     if (glopts->samplerate_out != glopts->samplerate_in) {
         fprintf(stderr,
                 "twolame_init_params(): sorry, twolame doesn't support resampling (yet).\n");
-        return -1;
+        goto fail;
     }
 
     // Initialise internal variables
@@ -404,10 +422,8 @@ int twolame_init_params(twolame_options * glopts)
             ||
             glopts->sb_sample == NULL)
     {
-        TWOLAME_FREE(glopts->subband);
-        TWOLAME_FREE(glopts->j_sample);
-        TWOLAME_FREE(glopts->sb_sample);
-        return -1;
+        fprintf(stderr, "twolame_init_params(): out of memory.\n");
+        goto fail;
     }
 
     // clear buffers
@@ -422,12 +438,33 @@ int twolame_init_params(twolame_options * glopts)
 
     // Initialise subband windowfilter
     if (twolame_init_subband(&glopts->smem) < 0) {
-        return -1;
+        goto fail;
     }
     // All initialised now :)
     glopts->twolame_init++;
 
+    // Success: commit the new state and drop the snapshot
+    TWOLAME_FREE(snapshot);
+
     return (0);
+
+  fail:
+    // Free any buffers allocated during this failed attempt
+    if (glopts->subband != snapshot->subband) {
+        TWOLAME_FREE(glopts->subband);
+    }
+    if (glopts->j_sample != snapshot->j_sample) {
+        TWOLAME_FREE(glopts->j_sample);
+    }
+    if (glopts->sb_sample != snapshot->sb_sample) {
+        TWOLAME_FREE(glopts->sb_sample);
+    }
+
+    // Roll the session back to its pre-initialisation state
+    memcpy(glopts, snapshot, sizeof(twolame_options));
+    TWOLAME_FREE(snapshot);
+
+    return -1;
 }
 
 
@@ -1000,6 +1037,7 @@ void twolame_close(twolame_options ** glopts)
 
     // Free the memory and zero the pointer
     TWOLAME_FREE(opts);
+    *glopts = NULL;
 }
 
 // vim:ts=4:sw=4:nowrap:
