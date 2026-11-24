@@ -212,6 +212,12 @@ TL_API int twolame_encode_buffer(twolame_options * glopts,
  *  Takes interleaved 16-bit PCM audio samples from a single
  *  buffer and places encoded audio into mp2buffer.
  *
+ *  The interleaved layout is left,right,left,right,... so for stereo
+ *  input the buffer must contain num_samples * 2 values. num_samples is
+ *  the number of samples per channel (not the total number of values),
+ *  exactly as for twolame_encode_buffer(); passing the total interleaved
+ *  value count here would read past the end of the buffer.
+ *
  *  \param glopts          twolame options pointer
  *  \param pcm             Audio samples for left AND right channels
  *  \param num_samples     Number of samples per channel
@@ -232,7 +238,9 @@ TL_API int twolame_encode_buffer_interleaved(twolame_options * glopts,
  *  left and right buffers and places encoded audio into mp2buffer.
  *
  *  Note: the 32-bit samples are currently scaled down to
- *  16-bit samples internally.
+ *  16-bit samples internally. Feeding the same integer values as the
+ *  integer entry points (x / 32768.0f) therefore produces the same
+ *  encoded frames.
  *
  *  \param glopts          twolame options pointer
  *  \param leftpcm         Left channel audio samples
@@ -254,6 +262,13 @@ TL_API int twolame_encode_buffer_float32(twolame_options * glopts,
  *
  *  Takes 32-bit floating point PCM audio samples from a single
  *  buffer and places encoded audio into mp2buffer.
+ *
+ *  The interleaved layout is left,right,left,right,... so for stereo
+ *  input the buffer must contain num_samples * 2 values. num_samples is
+ *  the number of samples per channel (not the total number of values).
+ *  The values are scaled to 16-bit internally, so feeding the same
+ *  integer values as the integer entry points (for example x / 32768.0f)
+ *  produces the same encoded frames.
  *
  *  \param glopts          twolame options pointer
  *  \param pcm             Audio samples for left AND right channels
