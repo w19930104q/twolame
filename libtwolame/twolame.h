@@ -285,6 +285,115 @@ TL_API int twolame_encode_flush(twolame_options * glopts,
                                     unsigned char *mp2buffer, int mp2buffer_size);
 
 
+/** Set the maximum size of a single output chunk.
+ *
+ *  Enables bounded chunked output: encoded audio is queued
+ *  internally and handed back to the caller in pieces of at
+ *  most chunk_size bytes via twolame_chunk_read().
+ *  A chunk_size of 0 disables chunked output.
+ *
+ *  Default: 0 (disabled)
+ *
+ *  \param glopts          pointer to twolame options pointer
+ *  \param chunk_size      maximum number of bytes per output chunk
+ *  \return                0 if successful, non-zero on failure
+ */
+TL_API int twolame_set_out_chunk_size(twolame_options * glopts, int chunk_size);
+
+
+/** Get the maximum size of a single output chunk.
+ *
+ *  \param glopts          pointer to twolame options pointer
+ *  \return                the maximum number of bytes per output chunk
+ */
+TL_API int twolame_get_out_chunk_size(twolame_options * glopts);
+
+
+/** Encode some 16-bit PCM audio to MP2 for chunked output.
+ *
+ *  Takes 16-bit PCM audio samples from separate left and right
+ *  buffers. Encoded audio is queued internally and can be
+ *  retrieved in bounded chunks with twolame_chunk_read().
+ *  Requires twolame_set_out_chunk_size() to have been called
+ *  with a non-zero chunk size.
+ *
+ *  The queued output is only updated on success: if an error
+ *  occurs, no partial MPEG audio frame is committed to the
+ *  output queue.
+ *
+ *  \param glopts          twolame options pointer
+ *  \param leftpcm         Left channel audio samples
+ *  \param rightpcm        Right channel audio samples
+ *  \param num_samples     Number of samples per channel
+ *  \return                0 on success, or a negative value on error
+ */
+TL_API int twolame_encode_chunk(twolame_options * glopts,
+                                    const short int leftpcm[],
+                                    const short int rightpcm[], int num_samples);
+
+
+/** Encode some 16-bit PCM audio to MP2 for chunked output.
+ *
+ *  Takes interleaved 16-bit PCM audio samples from a single
+ *  buffer. Encoded audio is queued internally and can be
+ *  retrieved in bounded chunks with twolame_chunk_read().
+ *  Requires twolame_set_out_chunk_size() to have been called
+ *  with a non-zero chunk size.
+ *
+ *  The queued output is only updated on success: if an error
+ *  occurs, no partial MPEG audio frame is committed to the
+ *  output queue.
+ *
+ *  \param glopts          twolame options pointer
+ *  \param pcm             Audio samples for left AND right channels
+ *  \param num_samples     Number of samples per channel
+ *  \return                0 on success, or a negative value on error
+ */
+TL_API int twolame_encode_chunk_interleaved(twolame_options * glopts,
+        const short int pcm[], int num_samples);
+
+
+/** Flush any remaining buffered PCM audio into the chunk queue.
+ *
+ *  Encodes any remaining audio samples in the libtwolame
+ *  internal sample buffer and queues the result for retrieval
+ *  with twolame_chunk_read(). This function is idempotent:
+ *  calling it more than once has no additional effect, so the
+ *  trailing empty (end-of-stream) chunk is produced exactly once.
+ *
+ *  \param glopts          twolame options pointer
+ *  \return                0 on success, or a negative value on error
+ */
+TL_API int twolame_flush_chunk(twolame_options * glopts);
+
+
+/** Get the number of encoded bytes waiting in the chunk queue.
+ *
+ *  \param glopts          twolame options pointer
+ *  \return                the number of queued bytes, or a negative
+ *                         value on error
+ */
+TL_API int twolame_chunk_pending(twolame_options * glopts);
+
+
+/** Read the next chunk of encoded audio.
+ *
+ *  Copies at most the configured chunk size (and at most
+ *  chunk_buffer_size) bytes of encoded audio into chunk.
+ *
+ *  \param glopts            twolame options pointer
+ *  \param chunk             buffer to place the chunk into
+ *  \param chunk_buffer_size size of the chunk buffer
+ *  \return                The number of bytes placed in chunk (>0),
+ *                         0 for the end-of-stream marker (returned
+ *                         exactly once, after twolame_flush_chunk(),
+ *                         when no more data is queued), or a negative
+ *                         value when no chunk is currently available
+ */
+TL_API int twolame_chunk_read(twolame_options * glopts,
+                                  unsigned char *chunk, int chunk_buffer_size);
+
+
 /** Shut down the twolame encoder.
  *
  *  Shuts down the twolame encoder and frees all memory

@@ -13,6 +13,7 @@ libtwolame_la_SOURCES = \
 	bitbuffer.c \
 	bitbuffer.h \
 	bitbuffer_inline.h \
+	chunk.c \
 	common.h \
 	crc.c \
 	crc.h \

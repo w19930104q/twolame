@@ -514,4 +514,21 @@ int twolame_set_DAB_scf_crc(twolame_options * glopts,
 }
 
 
+/* maximum size of a single output chunk (0 disables chunked output) */
+int twolame_set_out_chunk_size(twolame_options * glopts, int chunk_size)
+{
+    if (chunk_size < 0) {
+        fprintf(stderr, "invalid output chunk size %i\n", chunk_size);
+        return (-1);
+    }
+    glopts->chunk_size = chunk_size;
+    return (0);
+}
+
+int twolame_get_out_chunk_size(twolame_options * glopts)
+{
+    return (glopts->chunk_size);
+}
+
+
 // vim:ts=4:sw=4:nowrap:

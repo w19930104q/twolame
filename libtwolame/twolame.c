@@ -118,6 +118,14 @@ twolame_options *twolame_init(void)
     newoptions->p3mem = NULL;
     newoptions->p4mem = NULL;
 
+    // Bounded chunked output is disabled by default
+    newoptions->chunk_buf = NULL;
+    newoptions->chunk_buf_size = 0;
+    newoptions->chunk_len = 0;
+    newoptions->chunk_size = 0;
+    newoptions->chunk_flushed = 0;
+    newoptions->chunk_eof_sent = 0;
+
     return (newoptions);
 }
 
@@ -997,6 +1005,7 @@ void twolame_close(twolame_options ** glopts)
     TWOLAME_FREE(opts->subband);
     TWOLAME_FREE(opts->j_sample);
     TWOLAME_FREE(opts->sb_sample);
+    TWOLAME_FREE(opts->chunk_buf);
 
     // Free the memory and zero the pointer
     TWOLAME_FREE(opts);

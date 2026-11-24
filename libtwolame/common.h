@@ -368,6 +368,14 @@ struct twolame_options_struct {
     int tablenum;
 
     int vbrstats[15];
+
+    // Bounded chunked output state (see chunk.c)
+    unsigned char *chunk_buf;   // Queued encoded bytes awaiting collection [NULL]
+    int chunk_buf_size;         // Allocated size of chunk_buf [0]
+    int chunk_len;              // Number of bytes currently queued in chunk_buf [0]
+    int chunk_size;             // Maximum bytes per output chunk [0 = chunked output disabled]
+    int chunk_flushed;          // twolame_flush_chunk() has completed [FALSE]
+    int chunk_eof_sent;         // The single trailing empty chunk has been delivered [FALSE]
 };
 
 #endif                          // TWOLAME_COMMON_H
