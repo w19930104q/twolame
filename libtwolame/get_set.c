@@ -514,4 +514,20 @@ int twolame_set_DAB_scf_crc(twolame_options * glopts,
 }
 
 
+unsigned long twolame_get_frame_count(twolame_options * glopts)
+{
+    return (glopts->frame_count);
+}
+
+unsigned long twolame_get_sample_count(twolame_options * glopts)
+{
+    return (glopts->sample_count);
+}
+
+unsigned long twolame_get_padding_count(twolame_options * glopts)
+{
+    return (glopts->padding_count);
+}
+
+
 // vim:ts=4:sw=4:nowrap:

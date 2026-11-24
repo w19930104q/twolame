@@ -331,6 +331,14 @@ struct twolame_options_struct {
     unsigned int psycount;
     unsigned int num_crc_bits;  // Number of bits CRC is calculated on
 
+    // Encoding ledger: frame and input-sample accounting.
+    // These counters can be persisted with twolame_save_ledger()
+    // and restored with twolame_load_ledger().
+    unsigned long frame_count;  // Number of MPEG frames committed so far
+    unsigned long sample_count; // Total number of input samples received (per channel)
+    unsigned long padding_count;    // Number of tail padding samples (counted once)
+    int encode_flushed;         // Non-zero once the tail frame has been flushed
+
     unsigned int bit_alloc[2][SBLIMIT];
     unsigned int scfsi[2][SBLIMIT];
     unsigned int scalar[2][3][SBLIMIT];

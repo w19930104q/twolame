@@ -393,6 +393,12 @@ int twolame_init_params(twolame_options * glopts)
     glopts->samples_in_buffer = 0;
     glopts->psycount = 0;
 
+    // Reset the encoding ledger for the new session
+    glopts->frame_count = 0;
+    glopts->sample_count = 0;
+    glopts->padding_count = 0;
+    glopts->encode_flushed = 0;
+
 
     // Allocate memory to larger buffers
     glopts->subband = (subband_t *) TWOLAME_MALLOC(sizeof(subband_t));
@@ -659,6 +665,9 @@ static int encode_frame(twolame_options * glopts, bit_stream * bs)
     }
     // fprintf(stderr,"Frame size: %li\n\n",frameBits/8);
 
+    // Ledger: one more MPEG frame has been committed
+    glopts->frame_count++;
+
     return frameBits / 8;
 }
 
@@ -685,6 +694,12 @@ int twolame_encode_buffer(twolame_options * glopts,
 
     if (num_samples == 0)
         return 0;
+
+    // Once the tail frame has been flushed, no more input may be encoded
+    if (glopts->encode_flushed) {
+        fprintf(stderr, "twolame: cannot encode more samples after twolame_encode_flush().\n");
+        return -1;
+    }
 
 
     // now would be a great time to validate the size of the buffer.
@@ -713,6 +728,7 @@ int twolame_encode_buffer(twolame_options * glopts,
 
             /* Update sample counts */
             glopts->samples_in_buffer += samples_to_copy;
+            glopts->sample_count += samples_to_copy;
             num_samples -= samples_to_copy;
 
 
@@ -747,6 +763,12 @@ int twolame_encode_buffer_interleaved(twolame_options * glopts,
     if (num_samples == 0)
         return 0;
 
+    // Once the tail frame has been flushed, no more input may be encoded
+    if (glopts->encode_flushed) {
+        fprintf(stderr, "twolame: cannot encode more samples after twolame_encode_flush().\n");
+        return -1;
+    }
+
 
     // now would be a great time to validate the size of the buffer.
     // samples/1152 * sizeof(frame) < mp2buffer_size
@@ -774,6 +796,7 @@ int twolame_encode_buffer_interleaved(twolame_options * glopts,
 
             /* Update sample counts */
             glopts->samples_in_buffer += samples_to_copy;
+            glopts->sample_count += samples_to_copy;
             num_samples -= samples_to_copy;
 
 
@@ -835,6 +858,12 @@ int twolame_encode_buffer_float32(twolame_options * glopts,
     if (num_samples == 0)
         return 0;
 
+    // Once the tail frame has been flushed, no more input may be encoded
+    if (glopts->encode_flushed) {
+        fprintf(stderr, "twolame: cannot encode more samples after twolame_encode_flush().\n");
+        return -1;
+    }
+
 
     // now would be a great time to validate the size of the buffer.
     // samples/1152 * sizeof(frame) < mp2buffer_size
@@ -860,6 +889,7 @@ int twolame_encode_buffer_float32(twolame_options * glopts,
 
             /* Update sample counts */
             glopts->samples_in_buffer += samples_to_copy;
+            glopts->sample_count += samples_to_copy;
             num_samples -= samples_to_copy;
 
 
@@ -894,6 +924,12 @@ int twolame_encode_buffer_float32_interleaved(twolame_options * glopts,
     if (num_samples == 0)
         return 0;
 
+    // Once the tail frame has been flushed, no more input may be encoded
+    if (glopts->encode_flushed) {
+        fprintf(stderr, "twolame: cannot encode more samples after twolame_encode_flush().\n");
+        return -1;
+    }
+
 
     // now would be a great time to validate the size of the buffer.
     // samples/1152 * sizeof(frame) < mp2buffer_size
@@ -919,6 +955,7 @@ int twolame_encode_buffer_float32_interleaved(twolame_options * glopts,
 
             /* Update sample counts */
             glopts->samples_in_buffer += samples_to_copy;
+            glopts->sample_count += samples_to_copy;
             num_samples -= samples_to_copy;
 
 
@@ -949,6 +986,14 @@ int twolame_encode_flush(twolame_options * glopts, unsigned char *mp2buffer, int
     int mp2_size = 0;
     int i;
 
+    // The stream ends here: no more input may be encoded after a flush
+    if (glopts->encode_flushed) {
+        // Already flushed once: the tail padding has already been
+        // accounted for, don't count it (or anything else) again.
+        return 0;
+    }
+    glopts->encode_flushed = 1;
+
     if (glopts->samples_in_buffer == 0) {
         // No samples left over
         return 0;
@@ -957,6 +1002,10 @@ int twolame_encode_flush(twolame_options * glopts, unsigned char *mp2buffer, int
     mybs = twolame_buffer_init(mp2buffer, mp2buffer_size);
 
     if (mybs != NULL) {
+        // Ledger: the tail frame is padded out with silence.
+        // Record the padding exactly once.
+        glopts->padding_count += TWOLAME_SAMPLES_PER_FRAME - glopts->samples_in_buffer;
+
         // Pad out the PCM buffers with 0 and encode the frame
         for (i = glopts->samples_in_buffer; i < TWOLAME_SAMPLES_PER_FRAME; i++) {
             glopts->buffer[0][i] = glopts->buffer[1][i] = 0;
@@ -971,6 +1020,110 @@ int twolame_encode_flush(twolame_options * glopts, unsigned char *mp2buffer, int
     }
 
     return mp2_size;
+}
+
+
+
+/*
+ * Persistent encoding ledger.
+ *
+ * The ledger records how many MPEG frames have been committed, how many
+ * input samples were consumed and how many tail padding samples were
+ * added.  It can be saved to disk and loaded back into a fresh session
+ * so that reopening a stream reports exactly the same accounting.
+ */
+
+#define TWOLAME_LEDGER_MAGIC    "TWOLAME-LEDGER"
+#define TWOLAME_LEDGER_VERSION  1
+
+int twolame_save_ledger(twolame_options * glopts, const char *filename)
+{
+    FILE *file;
+
+    if (glopts == NULL || filename == NULL)
+        return -1;
+
+    file = fopen(filename, "w");
+    if (file == NULL) {
+        fprintf(stderr, "twolame_save_ledger(): unable to open '%s' for writing.\n", filename);
+        return -1;
+    }
+
+    fprintf(file, "%s %d\n", TWOLAME_LEDGER_MAGIC, TWOLAME_LEDGER_VERSION);
+    fprintf(file, "frames %lu\n", glopts->frame_count);
+    fprintf(file, "samples %lu\n", glopts->sample_count);
+    fprintf(file, "padding %lu\n", glopts->padding_count);
+    fprintf(file, "flushed %d\n", glopts->encode_flushed ? 1 : 0);
+
+    if (fclose(file) != 0) {
+        fprintf(stderr, "twolame_save_ledger(): failed to write '%s'.\n", filename);
+        return -1;
+    }
+
+    return 0;
+}
+
+
+int twolame_load_ledger(twolame_options * glopts, const char *filename)
+{
+    FILE *file;
+    char line[256];
+    char key[256];
+    int version;
+    unsigned long frames = 0;
+    unsigned long samples = 0;
+    unsigned long padding = 0;
+    int flushed = 0;
+    int have_header = 0;
+
+    if (glopts == NULL || filename == NULL)
+        return -1;
+
+    file = fopen(filename, "r");
+    if (file == NULL) {
+        fprintf(stderr, "twolame_load_ledger(): unable to open '%s' for reading.\n", filename);
+        return -1;
+    }
+
+    // First line must be the magic and format version
+    if (fgets(line, sizeof(line), file) == NULL
+            || sscanf(line, "%255s %d", key, &version) != 2
+            || strcmp(key, TWOLAME_LEDGER_MAGIC) != 0
+            || version != TWOLAME_LEDGER_VERSION) {
+        fprintf(stderr, "twolame_load_ledger(): '%s' is not a recognised ledger file.\n",
+                filename);
+        fclose(file);
+        return -1;
+    }
+    have_header = 1;
+
+    while (fgets(line, sizeof(line), file) != NULL) {
+        unsigned long value;
+        if (sscanf(line, "%255s %lu", key, &value) != 2)
+            continue;
+        if (strcmp(key, "frames") == 0)
+            frames = value;
+        else if (strcmp(key, "samples") == 0)
+            samples = value;
+        else if (strcmp(key, "padding") == 0)
+            padding = value;
+        else if (strcmp(key, "flushed") == 0)
+            flushed = (value != 0);
+        // Unknown keys are ignored for forward compatibility
+    }
+
+    fclose(file);
+
+    if (!have_header)
+        return -1;
+
+    // Restore the ledger: reopening must not change the accounting
+    glopts->frame_count = frames;
+    glopts->sample_count = samples;
+    glopts->padding_count = padding;
+    glopts->encode_flushed = flushed;
+
+    return 0;
 }
 
 

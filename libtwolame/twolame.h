@@ -285,6 +285,70 @@ TL_API int twolame_encode_flush(twolame_options * glopts,
                                     unsigned char *mp2buffer, int mp2buffer_size);
 
 
+/** Get the number of MPEG frames committed so far.
+ *
+ *  Every complete frame produced by the encode functions (including
+ *  the padded tail frame produced by twolame_encode_flush()) is
+ *  counted exactly once.
+ *
+ *  \param glopts          twolame options pointer
+ *  \return                number of MPEG frames encoded
+ */
+TL_API unsigned long twolame_get_frame_count(twolame_options * glopts);
+
+
+/** Get the total number of input samples consumed so far.
+ *
+ *  Counts input samples per channel as passed to the encode functions.
+ *  Tail padding added by twolame_encode_flush() is not included here.
+ *
+ *  \param glopts          twolame options pointer
+ *  \return                number of input samples received
+ */
+TL_API unsigned long twolame_get_sample_count(twolame_options * glopts);
+
+
+/** Get the number of tail padding samples.
+ *
+ *  The final frame is padded with silence up to a whole frame of
+ *  TWOLAME_SAMPLES_PER_FRAME samples.  The padding is accounted
+ *  exactly once, no matter how often the session is queried,
+ *  flushed, closed and reopened.
+ *
+ *  \param glopts          twolame options pointer
+ *  \return                number of padding samples in the tail frame
+ */
+TL_API unsigned long twolame_get_padding_count(twolame_options * glopts);
+
+
+/** Save the encoding ledger to a file.
+ *
+ *  Persists the frame/sample/padding accounting (as reported by
+ *  twolame_get_frame_count(), twolame_get_sample_count() and
+ *  twolame_get_padding_count()) so it can be restored into a
+ *  later session with twolame_load_ledger().
+ *
+ *  \param glopts          twolame options pointer
+ *  \param filename        path of the ledger file to write
+ *  \return                0 if successful, negative on failure
+ */
+TL_API int twolame_save_ledger(twolame_options * glopts, const char *filename);
+
+
+/** Load a previously saved encoding ledger from a file.
+ *
+ *  Restores the frame/sample/padding accounting saved with
+ *  twolame_save_ledger().  Loading a ledger only restores the
+ *  recorded counters; it never increases them, so closing and
+ *  reopening a session leaves the reported frame count unchanged.
+ *
+ *  \param glopts          twolame options pointer
+ *  \param filename        path of the ledger file to read
+ *  \return                0 if successful, negative on failure
+ */
+TL_API int twolame_load_ledger(twolame_options * glopts, const char *filename);
+
+
 /** Shut down the twolame encoder.
  *
  *  Shuts down the twolame encoder and frees all memory
