@@ -285,6 +285,117 @@ TL_API int twolame_encode_flush(twolame_options * glopts,
                                     unsigned char *mp2buffer, int mp2buffer_size);
 
 
+/** Encode exactly one whole frame atomically (constant bitrate).
+ *
+ *  Consumes TWOLAME_SAMPLES_PER_FRAME samples per channel and produces
+ *  exactly one MPEG audio frame in mp2buffer. In constant (non-VBR)
+ *  bitrate mode the returned size is always the fixed per-frame byte
+ *  budget, so a downstream muxer sees no frame-to-frame size variation.
+ *
+ *  The call is transactional: the frame is first assembled in an
+ *  internal scratch buffer and is only copied to mp2buffer once it has
+ *  been built successfully. If anything fails, no bytes are written to
+ *  mp2buffer and every encoder state change made for the attempt
+ *  (sample buffer, psychoacoustic history, reservoir counters, frame
+ *  count) is rolled back, so the already committed frames stay byte for
+ *  byte unchanged and the session can be retried.
+ *
+ *  \param glopts          twolame options pointer
+ *  \param leftpcm         TWOLAME_SAMPLES_PER_FRAME left channel samples
+ *  \param rightpcm        TWOLAME_SAMPLES_PER_FRAME right channel samples
+ *                         (ignored for mono, may be NULL there)
+ *  \param mp2buffer       buffer receiving the single encoded frame
+ *  \param mp2buffer_size  size of mp2buffer; must hold one frame
+ *  \return                the frame size in bytes (the fixed budget),
+ *                         or a negative value on failure (nothing committed)
+ */
+TL_API int twolame_encode_frame_commit(twolame_options * glopts,
+                                           const short int leftpcm[],
+                                           const short int rightpcm[],
+                                           unsigned char *mp2buffer,
+                                           int mp2buffer_size);
+
+
+/** Number of frames successfully committed so far.
+ *
+ *  A frame is counted only once it has been fully built and committed;
+ *  a rolled-back attempt never increments the count.
+ *
+ *  \param glopts          twolame options pointer
+ *  \return                number of committed MPEG frames
+ */
+TL_API unsigned long twolame_get_frame_count(twolame_options * glopts);
+
+
+/** Size, in bytes, of the most recently committed frame.
+ *
+ *  \param glopts          twolame options pointer
+ *  \return                last frame size in bytes, or 0 before the first frame
+ */
+TL_API int twolame_get_last_frame_bytes(twolame_options * glopts);
+
+
+/** Signed bit-reservoir balance in bits.
+ *
+ *  A positive balance means bits saved by earlier frames are available
+ *  to borrow; a negative balance means bits are owed. For fixed-rate
+ *  CBR output every frame spends exactly its own budget, so the balance
+ *  stays at zero throughout the stream.
+ *
+ *  \param glopts          twolame options pointer
+ *  \return                reservoir balance in bits (0 for fixed CBR)
+ */
+TL_API long twolame_get_reservoir_balance(twolame_options * glopts);
+
+
+/** Total number of bits ever borrowed from the reservoir.
+ *
+ *  \param glopts          twolame options pointer
+ *  \return                gross borrowed bits over all committed frames
+ */
+TL_API unsigned long twolame_get_reservoir_borrowed(twolame_options * glopts);
+
+
+/** Total number of bits ever paid back into the reservoir.
+ *
+ *  For a balanced stream this equals twolame_get_reservoir_borrowed(),
+ *  so the net reservoir movement over the whole stream is zero.
+ *
+ *  \param glopts          twolame options pointer
+ *  \return                gross repaid bits over all committed frames
+ */
+TL_API unsigned long twolame_get_reservoir_repaid(twolame_options * glopts);
+
+
+/** Test hook: force an upcoming frame to fail.
+ *
+ *  Arranges for the next 'count' calls to twolame_encode_frame_commit()
+ *  to fail during assembly without committing anything, which lets a
+ *  caller exercise the rollback path deterministically. A count of 0
+ *  (the default) disables the fault.
+ *
+ *  \param glopts          twolame options pointer
+ *  \param count           number of upcoming frame attempts that must fail
+ *  \return                0 on success, negative on an invalid argument
+ */
+TL_API int twolame_set_fail_after_frames(twolame_options * glopts, int count);
+
+
+/** Test hook: force an upcoming frame to fail late.
+ *
+ *  Like twolame_set_fail_after_frames(), but the failure is raised only
+ *  after the frame's audio processing and all encoder state changes have
+ *  run, immediately before the frame would be committed. This drives the
+ *  deep rollback path (including memory lazily allocated during the
+ *  frame). A count of 0 disables the fault.
+ *
+ *  \param glopts          twolame options pointer
+ *  \param count           number of upcoming frame attempts that fail late
+ *  \return                0 on success, negative on an invalid argument
+ */
+TL_API int twolame_set_fail_late_frames(twolame_options * glopts, int count);
+
+
 /** Shut down the twolame encoder.
  *
  *  Shuts down the twolame encoder and frees all memory

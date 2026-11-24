@@ -331,6 +331,19 @@ struct twolame_options_struct {
     unsigned int psycount;
     unsigned int num_crc_bits;  // Number of bits CRC is calculated on
 
+    // Fixed-bitrate (TW-E) frame and bit-reservoir accounting.
+    // Every successfully committed frame has exactly the fixed per-frame
+    // byte budget; bits the audio does not need are zero padded inside the
+    // same frame and recorded as reservoir savings, so the running balance
+    // and the gross borrow/repay totals stay at zero for constant CBR.
+    unsigned long frame_count;          // Number of frames committed so far
+    int last_frame_bytes;               // Size of the last committed frame (bytes)
+    long reservoir_balance;             // Signed reservoir balance (bits); 0 for fixed CBR
+    unsigned long reservoir_borrowed;   // Gross bits borrowed from the reservoir
+    unsigned long reservoir_repaid;     // Gross bits paid back to the reservoir
+    int fail_after_frames;              // Test hook: force the Nth next frame to fail (0 = off)
+    int fail_late_frames;               // Test hook: fail after state mutation, before commit (0 = off)
+
     unsigned int bit_alloc[2][SBLIMIT];
     unsigned int scfsi[2][SBLIMIT];
     unsigned int scalar[2][3][SBLIMIT];

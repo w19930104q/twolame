@@ -112,6 +112,15 @@ twolame_options *twolame_init(void)
     newoptions->sb_sample = NULL;
     newoptions->psycount = 0;
 
+    // Fixed-bitrate frame and bit-reservoir accounting (TW-E)
+    newoptions->frame_count = 0;
+    newoptions->last_frame_bytes = 0;
+    newoptions->reservoir_balance = 0;
+    newoptions->reservoir_borrowed = 0;
+    newoptions->reservoir_repaid = 0;
+    newoptions->fail_after_frames = 0;
+    newoptions->fail_late_frames = 0;
+
     newoptions->p0mem = NULL;
     newoptions->p1mem = NULL;
     newoptions->p2mem = NULL;
@@ -393,6 +402,15 @@ int twolame_init_params(twolame_options * glopts)
     glopts->samples_in_buffer = 0;
     glopts->psycount = 0;
 
+    // Reset fixed-bitrate frame and bit-reservoir accounting for the new session
+    glopts->frame_count = 0;
+    glopts->last_frame_bytes = 0;
+    glopts->reservoir_balance = 0;
+    glopts->reservoir_borrowed = 0;
+    glopts->reservoir_repaid = 0;
+    glopts->fail_after_frames = 0;
+    glopts->fail_late_frames = 0;
+
 
     // Allocate memory to larger buffers
     glopts->subband = (subband_t *) TWOLAME_MALLOC(sizeof(subband_t));
@@ -499,6 +517,15 @@ static int encode_frame(twolame_options * glopts, bit_stream * bs)
         fprintf(stderr, "Please call twolame_init_params() before starting encoding.\n");
         return -1;
     }
+
+    /* Test hook: deterministically fail this attempt before touching any
+       encoder state, so the transactional caller can roll back cleanly. */
+    if (glopts->fail_after_frames > 0) {
+        glopts->fail_after_frames--;
+        fprintf(stderr, "encode_frame: injected frame failure for rollback testing.\n");
+        return -1;
+    }
+
     // Scale and mix the input buffer
     scale_and_mix_samples(glopts);
 
@@ -652,6 +679,16 @@ static int encode_frame(twolame_options * glopts, bit_stream * bs)
     if (glopts->do_energy_levels)
         twolame_do_energy_levels(glopts, bs);
 
+    /* Test hook: fail here, after every per-frame state change (including
+       any lazily allocated psychoacoustic memory) but before the frame is
+       committed and the accounting is finalised. This exercises the full
+       deep rollback path. */
+    if (glopts->fail_late_frames > 0) {
+        glopts->fail_late_frames--;
+        fprintf(stderr, "encode_frame: injected late frame failure for rollback testing.\n");
+        return -1;
+    }
+
     // MEANX: Recompute checksum from bitstream
     if (glopts->error_protection) {
         unsigned char *frame_ptr = bs->buf + (initial_bits >> 3);
@@ -659,7 +696,328 @@ static int encode_frame(twolame_options * glopts, bit_stream * bs)
     }
     // fprintf(stderr,"Frame size: %li\n\n",frameBits/8);
 
+    /*
+     * Fixed-bitrate (TW-E) bit-reservoir accounting.
+     *
+     * 'adb' is the number of audio bits left after bit allocation; the
+     * loop above writes that many zero padding bits so the frame always
+     * fills its fixed byte budget. In constant bitrate mode the allocator
+     * never grants a frame more than its own budget, so those unused bits
+     * are slack zero-padded inside the same frame and are NOT carried into
+     * a cross-frame reservoir: every frame stays independent and exactly
+     * frameBits/8 bytes long, which is what a fixed-rate muxer requires.
+     *
+     * A cross-frame borrow only occurs if a frame genuinely needs more
+     * bits than its budget (adb < 0); the shortfall is taken from the
+     * reservoir and repaid by a later frame's surplus. The fixed CBR
+     * encoder never hits that path, so over a whole constant-rate stream
+     * the gross borrow and repay totals are both zero and the balance is
+     * zero, even though the reservoir mechanism remains available.
+     */
+    if (adb < 0) {
+        unsigned long deficit = (unsigned long) (-adb);
+        glopts->reservoir_borrowed += deficit;
+        glopts->reservoir_balance -= (long) deficit;
+    } else if (glopts->reservoir_balance < 0 && adb > 0) {
+        /* Repay an outstanding borrow with this frame's surplus. */
+        unsigned long surplus = (unsigned long) adb;
+        unsigned long owed = (unsigned long) (-glopts->reservoir_balance);
+        if (surplus > owed)
+            surplus = owed;
+        glopts->reservoir_repaid += surplus;
+        glopts->reservoir_balance += (long) surplus;
+    }
+
+    // One more frame has been fully built and committed
+    glopts->frame_count++;
+    glopts->last_frame_bytes = (int) (frameBits / 8);
+
     return frameBits / 8;
+}
+
+
+
+/*
+ * Transactional, fixed-budget single-frame encoder (TW-E).
+ *
+ * A whole frame is assembled into a private scratch buffer first. Only
+ * when it builds successfully are its bytes published to the caller's
+ * output buffer and the accounting committed. On any failure nothing is
+ * published and the full encoder state captured before the attempt is
+ * restored, so previously committed frames are never altered.
+ */
+
+/* Generous upper bound for one Layer II frame, well beyond freeformat. */
+#define TWOLAME_FRAME_SCRATCH_BYTES  4096
+
+/*
+ * Deep backup of the encoder state. The options struct is copied whole,
+ * but it also owns several heap blocks (the subband working arrays and the
+ * psychoacoustic model history) whose contents advance as a frame is built.
+ * Those blocks are copied too so a failed frame can be fully undone.
+ */
+#define TWOLAME_STATE_BLOCKS  8
+
+struct twolame_deep_backup {
+    twolame_options *snapshot;
+    struct {
+        void *orig;             /* pointer field inside the live struct */
+        void *copy;             /* saved contents */
+        size_t size;
+    } block[TWOLAME_STATE_BLOCKS];
+    int nblocks;
+};
+
+/* Capture the live state and every heap block it owns. */
+static int twolame_backup_capture(twolame_options * glopts,
+                                  struct twolame_deep_backup *bak)
+{
+    void *blocks[TWOLAME_STATE_BLOCKS];
+    size_t sizes[TWOLAME_STATE_BLOCKS];
+    int n = 0, i;
+
+    memset(bak, 0, sizeof(*bak));
+    bak->snapshot = (twolame_options *) TWOLAME_MALLOC(sizeof(twolame_options));
+    if (bak->snapshot == NULL)
+        return -1;
+    memcpy(bak->snapshot, glopts, sizeof(twolame_options));
+
+    blocks[0] = glopts->subband;  sizes[0] = sizeof(*glopts->subband);
+    blocks[1] = glopts->j_sample; sizes[1] = sizeof(*glopts->j_sample);
+    blocks[2] = glopts->sb_sample;        sizes[2] = sizeof(*glopts->sb_sample);
+    blocks[3] = glopts->p0mem;    sizes[3] = sizeof(*glopts->p0mem);
+    blocks[4] = glopts->p1mem;    sizes[4] = sizeof(*glopts->p1mem);
+    blocks[5] = glopts->p2mem;    sizes[5] = sizeof(*glopts->p2mem);
+    blocks[6] = glopts->p3mem;    sizes[6] = sizeof(*glopts->p3mem);
+    blocks[7] = glopts->p4mem;    sizes[7] = sizeof(*glopts->p4mem);
+
+    /* Record every slot, including NULL ones: on rollback a slot that was
+       NULL here but non-NULL afterwards holds a block allocated during the
+       failed frame and must be freed rather than leaked. */
+    for (i = 0; i < TWOLAME_STATE_BLOCKS; i++) {
+        bak->block[i].orig = blocks[i];
+        bak->block[i].size = sizes[i];
+        if (blocks[i] != NULL) {
+            bak->block[i].copy = TWOLAME_MALLOC(sizes[i]);
+            if (bak->block[i].copy == NULL) {
+                bak->nblocks = i;
+                return -1;
+            }
+            memcpy(bak->block[i].copy, blocks[i], sizes[i]);
+            n++;
+        } else {
+            bak->block[i].copy = NULL;
+        }
+    }
+    bak->nblocks = n;
+    return 0;
+}
+
+/* Restore the live struct and the saved heap-block contents, then free.
+ * Blocks lazily allocated during the failed attempt (NULL at capture,
+ * non-NULL now) are released so rollback never leaks memory. */
+static void twolame_backup_rollback(twolame_options * glopts,
+                                    struct twolame_deep_backup *bak)
+{
+    void *current[TWOLAME_STATE_BLOCKS];
+    int i;
+
+    /* Read the pointers as they are now, before the struct restore
+       overwrites them. These are the blocks actually in use after the
+       failed attempt (some may have been allocated during it). */
+    current[0] = glopts->subband;
+    current[1] = glopts->j_sample;
+    current[2] = glopts->sb_sample;
+    current[3] = glopts->p0mem;
+    current[4] = glopts->p1mem;
+    current[5] = glopts->p2mem;
+    current[6] = glopts->p3mem;
+    current[7] = glopts->p4mem;
+
+    /* Restore the struct so its pointer fields point back at the original
+       (still allocated) blocks. */
+    memcpy(glopts, bak->snapshot, sizeof(twolame_options));
+
+    for (i = 0; i < TWOLAME_STATE_BLOCKS; i++) {
+        if (bak->block[i].copy != NULL) {
+            /* Pre-existing block: overwrite its contents with the backup. */
+            memcpy(bak->block[i].orig, bak->block[i].copy,
+                   bak->block[i].size);
+        } else if (current[i] != NULL) {
+            /* NULL at capture but allocated during the failed frame:
+               release the freshly created block so it is not leaked. */
+            TWOLAME_FREE(current[i]);
+        }
+    }
+}
+
+static void twolame_backup_free(struct twolame_deep_backup *bak)
+{
+    int i;
+
+    for (i = 0; i < TWOLAME_STATE_BLOCKS; i++)
+        TWOLAME_FREE(bak->block[i].copy);
+    TWOLAME_FREE(bak->snapshot);
+}
+
+int twolame_encode_frame_commit(twolame_options * glopts,
+                                const short int leftpcm[],
+                                const short int rightpcm[],
+                                unsigned char *mp2buffer, int mp2buffer_size)
+{
+    struct twolame_deep_backup backup;
+    unsigned char *scratch = NULL;
+    bit_stream *bs = NULL;
+    int i, nch, bytes;
+
+    if (glopts == NULL || leftpcm == NULL || mp2buffer == NULL) {
+        fprintf(stderr, "twolame_encode_frame_commit(): NULL argument.\n");
+        return -1;
+    }
+    if (!glopts->twolame_init) {
+        fprintf(stderr, "Please call twolame_init_params() before starting encoding.\n");
+        return -1;
+    }
+    if (mp2buffer_size <= 0) {
+        fprintf(stderr, "twolame_encode_frame_commit(): invalid output buffer size.\n");
+        return -1;
+    }
+    nch = glopts->num_channels_in;
+    if (nch == 2 && rightpcm == NULL) {
+        fprintf(stderr, "twolame_encode_frame_commit(): stereo input needs a right channel.\n");
+        return -1;
+    }
+
+    /* Snapshot the full encoder state (struct plus heap blocks) so a
+       failure can be undone completely. */
+    if (twolame_backup_capture(glopts, &backup) != 0) {
+        twolame_backup_free(&backup);
+        fprintf(stderr, "twolame_encode_frame_commit(): out of memory.\n");
+        return -1;
+    }
+
+    scratch = (unsigned char *) TWOLAME_MALLOC(TWOLAME_FRAME_SCRATCH_BYTES);
+    if (scratch == NULL) {
+        twolame_backup_rollback(glopts, &backup);
+        twolame_backup_free(&backup);
+        fprintf(stderr, "twolame_encode_frame_commit(): out of memory.\n");
+        return -1;
+    }
+
+    /* Stage exactly one frame of input samples. */
+    for (i = 0; i < TWOLAME_SAMPLES_PER_FRAME; i++) {
+        glopts->buffer[0][i] = leftpcm[i];
+        if (nch == 2)
+            glopts->buffer[1][i] = rightpcm[i];
+        else
+            glopts->buffer[1][i] = leftpcm[i];
+    }
+    glopts->samples_in_buffer = TWOLAME_SAMPLES_PER_FRAME;
+
+    bs = twolame_buffer_init(scratch, TWOLAME_FRAME_SCRATCH_BYTES);
+    if (bs == NULL) {
+        twolame_backup_rollback(glopts, &backup);
+        twolame_backup_free(&backup);
+        TWOLAME_FREE(scratch);
+        fprintf(stderr, "twolame_encode_frame_commit(): out of memory.\n");
+        return -1;
+    }
+
+    bytes = encode_frame(glopts, bs);
+    twolame_buffer_deinit(&bs);
+
+    if (bytes <= 0 || bytes > TWOLAME_FRAME_SCRATCH_BYTES) {
+        /* The frame could not be built (or overflowed the scratch buffer):
+           roll back the whole attempt, including heap state, and publish
+           nothing. */
+        twolame_backup_rollback(glopts, &backup);
+        twolame_backup_free(&backup);
+        TWOLAME_FREE(scratch);
+        if (bytes > TWOLAME_FRAME_SCRATCH_BYTES)
+            fprintf(stderr,
+                    "twolame_encode_frame_commit(): frame of %d bytes exceeds the internal scratch size.\n",
+                    bytes);
+        return -1;
+    }
+
+    if (bytes > mp2buffer_size) {
+        /* The frame is valid but the caller cannot hold it: roll back and
+           publish nothing. */
+        twolame_backup_rollback(glopts, &backup);
+        twolame_backup_free(&backup);
+        TWOLAME_FREE(scratch);
+        fprintf(stderr,
+                "twolame_encode_frame_commit(): output buffer too small (%d < %d bytes).\n",
+                mp2buffer_size, bytes);
+        return -1;
+    }
+
+    /* Commit: publish the assembled frame only after full success. */
+    memcpy(mp2buffer, scratch, (size_t) bytes);
+    glopts->samples_in_buffer = 0;
+
+    TWOLAME_FREE(scratch);
+    twolame_backup_free(&backup);
+
+    return bytes;
+}
+
+
+unsigned long twolame_get_frame_count(twolame_options * glopts)
+{
+    if (glopts == NULL)
+        return 0;
+    return glopts->frame_count;
+}
+
+
+int twolame_get_last_frame_bytes(twolame_options * glopts)
+{
+    if (glopts == NULL)
+        return 0;
+    return glopts->last_frame_bytes;
+}
+
+
+long twolame_get_reservoir_balance(twolame_options * glopts)
+{
+    if (glopts == NULL)
+        return 0;
+    return glopts->reservoir_balance;
+}
+
+
+unsigned long twolame_get_reservoir_borrowed(twolame_options * glopts)
+{
+    if (glopts == NULL)
+        return 0;
+    return glopts->reservoir_borrowed;
+}
+
+
+unsigned long twolame_get_reservoir_repaid(twolame_options * glopts)
+{
+    if (glopts == NULL)
+        return 0;
+    return glopts->reservoir_repaid;
+}
+
+
+int twolame_set_fail_after_frames(twolame_options * glopts, int count)
+{
+    if (glopts == NULL || count < 0)
+        return -1;
+    glopts->fail_after_frames = count;
+    return 0;
+}
+
+
+int twolame_set_fail_late_frames(twolame_options * glopts, int count)
+{
+    if (glopts == NULL || count < 0)
+        return -1;
+    glopts->fail_late_frames = count;
+    return 0;
 }
 
 
